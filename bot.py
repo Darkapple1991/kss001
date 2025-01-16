@@ -1,742 +1,734 @@
 import os
 import logging
-import re
 from datetime import datetime, timedelta
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 import sqlite3
 
-# Настройка расширенного логирования
+# Enable logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    level=logging.DEBUG
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
+
 logger = logging.getLogger(__name__)
 
-# Состояния для ConversationHandler
+# States
 (ADDING_CLIENT_NAME, ADDING_CLIENT_PHONE, 
  SELECTING_CLIENT_FOR_RECEIPT, UPLOADING_RECEIPT, ADDING_RECEIPT_AMOUNT, ADDING_DEBT_DAYS,
  SELECTING_CLIENT_FOR_VIEW,
  SELECTING_CLIENT_FOR_DELETE, SELECTING_RECEIPT_FOR_DELETE,
  SELECTING_CLIENT_FOR_PAYMENT, ADDING_PAYMENT_AMOUNT) = range(11)
 
+# Keyboard for main menu
+def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
+        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
+        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# Database connection
 def get_connection():
-    """Создание подключения к базе данных."""
     try:
         return sqlite3.connect('debt_bot.db')
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка подключения к базе данных: {e}")
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
         raise
 
 def init_db():
-    """Инициализация таблиц базы данных."""
     try:
         conn = get_connection()
         cur = conn.cursor()
         
-        # Таблица клиентов
+        # Create clients table
         cur.execute('''CREATE TABLE IF NOT EXISTS clients
-                   (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    phone TEXT NOT NULL)''')
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name TEXT NOT NULL,
+                     phone TEXT NOT NULL)''')
         
-        # Таблица чеков
+        # Create receipts table
         cur.execute('''CREATE TABLE IF NOT EXISTS receipts
-                   (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    client_id INTEGER,
-                    photo_id TEXT,
-                    amount REAL,
-                    debt_days INTEGER,
-                    date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (client_id) REFERENCES clients (id))''')
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     client_id INTEGER,
+                     photo_id TEXT,
+                     amount REAL,
+                     debt_days INTEGER,
+                     date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                     FOREIGN KEY (client_id) REFERENCES clients (id))''')
         
-        # Таблица платежей
+        # Create payments table
         cur.execute('''CREATE TABLE IF NOT EXISTS payments
-                   (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    client_id INTEGER,
-                    amount REAL,
-                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (client_id) REFERENCES clients (id))''')
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     client_id INTEGER,
+                     amount REAL,
+                     date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                     FOREIGN KEY (client_id) REFERENCES clients (id))''')
         
         conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка инициализации базы данных: {e}")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
         raise
     finally:
-        if conn:
-            cur.close()
-            conn.close()
+        cur.close()
+        conn.close()
 
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    logger.info(f"Пользователь {update.effective_user.id} запустил бота")
-    
-    keyboard = [
-        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        'Выберите действие:',
-        reply_markup=reply_markup
-    )
-
+    """Send a message when the command /start is issued."""
+    try:
+        user_name = update.message.from_user.first_name
+        welcome_message = (
+            f"👋 Здравствуйте, {user_name}!\n\n"
+            "Это бот для управления долгами клиентов.\n"
+            "Выберите действие из меню ниже:"
+        )
+        await update.message.reply_text(
+            welcome_message,
+            reply_markup=get_main_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+        await update.message.reply_text("Произошла ошибка при запуске бота. Попробуйте позже.")
+# Client management
 async def add_client_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало добавления клиента"""
-    logger.info(f"Пользователь {update.effective_user.id} начал добавление клиента")
-    await update.message.reply_text("Введите имя клиента:")
-    return ADDING_CLIENT_NAME
+    """Start the process of adding a new client."""
+    try:
+        await update.message.reply_text(
+            "Введите имя клиента:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ADDING_CLIENT_NAME
+    except Exception as e:
+        logger.error(f"Error in add_client_start: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
 
 async def add_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка имени клиента"""
-    name = update.message.text.strip()
-    
-    if not name or len(name) > 100:
-        await update.message.reply_text("Пожалуйста, введите корректное имя (1-100 символов).")
-        return ADDING_CLIENT_NAME
-    
-    context.user_data['client_name'] = name
-    await update.message.reply_text("Введите номер телефона клиента:")
-    return ADDING_CLIENT_PHONE
+    """Process client name and ask for phone number."""
+    try:
+        name = update.message.text
+        if len(name.strip()) < 2:
+            await update.message.reply_text(
+                "Имя должно содержать минимум 2 символа. Попробуйте еще раз:"
+            )
+            return ADDING_CLIENT_NAME
+            
+        context.user_data['client_name'] = name
+        await update.message.reply_text(
+            "Введите номер телефона клиента:"
+        )
+        return ADDING_CLIENT_PHONE
+    except Exception as e:
+        logger.error(f"Error in add_client_name: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
 
 async def add_client_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка номера телефона и сохранение клиента"""
-    phone = update.message.text.strip()
-    name = context.user_data['client_name']
-    
+    """Process client phone number and save client to database."""
     try:
+        phone = update.message.text
+        name = context.user_data['client_name']
+        
+        # Simple phone validation
+        phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        if not phone.replace('+', '').isdigit():
+            await update.message.reply_text(
+                "Некорректный номер телефона. Попробуйте еще раз:"
+            )
+            return ADDING_CLIENT_PHONE
+        
         conn = get_connection()
         cur = conn.cursor()
         
-        # Проверка существования клиента
-        cur.execute("SELECT id FROM clients WHERE name = ? AND phone = ?", (name, phone))
+        # Check if phone already exists
+        cur.execute("SELECT name FROM clients WHERE phone = ?", (phone,))
         existing_client = cur.fetchone()
-        
         if existing_client:
-            await update.message.reply_text(f"Клиент {name} уже существует!")
+            await update.message.reply_text(
+                f"Этот номер телефона уже зарегистрирован на клиента {existing_client[0]}.",
+                reply_markup=get_main_keyboard()
+            )
             return ConversationHandler.END
         
-        # Добавление нового клиента
+        # Add new client
         cur.execute("INSERT INTO clients (name, phone) VALUES (?, ?)", (name, phone))
         conn.commit()
-        logger.info(f"Добавлен новый клиент: {name}, {phone}")
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при добавлении клиента: {e}")
-        await update.message.reply_text("Произошла ошибка при добавлении клиента.")
+        cur.close()
+        conn.close()
+        
+        await update.message.reply_text(
+            f"✅ Клиент {name} успешно добавлен!",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    keyboard = [
-        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        f"Клиент {name} успешно добавлен!",
-        reply_markup=reply_markup
-    )
-    return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error in add_client_phone: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при добавлении клиента. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
 
+# Receipt management
 async def add_receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало процесса добавления чека - выбор клиента"""
-    logger.info(f"Пользователь {update.effective_user.id} начал добавление чека")
-    
+    """Start the process of adding a new receipt."""
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, name FROM clients")
+        cur.execute("SELECT id, name, phone FROM clients ORDER BY name")
         clients = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении списка клиентов: {e}")
-        await update.message.reply_text("Не удалось получить список клиентов. Попробуйте позже.")
+        cur.close()
+        conn.close()
+        
+        if not clients:
+            await update.message.reply_text(
+                "❌ Сначала добавьте хотя бы одного клиента!",
+                reply_markup=get_main_keyboard()
+            )
+            return ConversationHandler.END
+        
+        keyboard = [[InlineKeyboardButton(f"{name} ({phone})", callback_data=f'client_{id}')] 
+                   for id, name, phone in clients]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "Выберите клиента:",
+            reply_markup=reply_markup
+        )
+        return SELECTING_CLIENT_FOR_RECEIPT
+        
+    except Exception as e:
+        logger.error(f"Error in add_receipt_start: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    if not clients:
-        await update.message.reply_text("Сначала добавьте клиента!")
-        return ConversationHandler.END
-    
-    # Создаем клавиатуру с клиентами
-    keyboard = []
-    for client_id, client_name in clients:
-        keyboard.append([InlineKeyboardButton(client_name, callback_data=f'client_{client_id}')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Выберите клиента для добавления чека:",
-        reply_markup=reply_markup
-    )
-    return SELECTING_CLIENT_FOR_RECEIPT
-
 async def select_client_for_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора клиента для чека"""
-    query = update.callback_query
-    await query.answer()
-    
+    """Handle client selection for receipt."""
     try:
+        query = update.callback_query
+        await query.answer()
+        
         client_id = int(query.data.split('_')[1])
         context.user_data['selected_client_id'] = client_id
         
-        await query.edit_message_text("Теперь отправьте фото чека:")
+        await query.edit_message_text("📸 Отправьте фото чека:")
         return UPLOADING_RECEIPT
     except Exception as e:
-        logger.error(f"Ошибка при выборе клиента: {e}")
-        await query.edit_message_text("Произошла ошибка. Попробуйте снова.")
+        logger.error(f"Error in select_client_for_receipt: {e}")
+        await query.edit_message_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
 
 async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фото чека"""
+    """Process receipt photo and ask for amount."""
     try:
-        # Получаем файл с наибольшим разрешением
         photo = update.message.photo[-1]
         context.user_data['receipt_photo_id'] = photo.file_id
         
-        await update.message.reply_text("Введите сумму чека:")
+        await update.message.reply_text(
+            "💰 Введите сумму чека (например: 1000.50):"
+        )
         return ADDING_RECEIPT_AMOUNT
     except Exception as e:
-        logger.error(f"Ошибка при обработке фото чека: {e}")
-        await update.message.reply_text("Не удалось сохранить фото. Попробуйте снова.")
+        logger.error(f"Error in handle_receipt_photo: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при обработке фото. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
 
 async def add_receipt_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка суммы чека"""
+    """Process receipt amount and ask for debt days."""
     try:
-        amount = float(update.message.text.replace(',', '.'))
-        
+        text = update.message.text.replace(',', '.')
+        amount = float(text)
         if amount <= 0:
-            await update.message.reply_text("Сумма должна быть положительной. Введите корректную сумму:")
+            await update.message.reply_text(
+                "❌ Сумма должна быть больше нуля. Попробуйте еще раз:"
+            )
             return ADDING_RECEIPT_AMOUNT
-        
+            
         context.user_data['receipt_amount'] = amount
-        await update.message.reply_text("Введите количество дней для оплаты долга:")
+        await update.message.reply_text(
+            "📅 Введите количество дней для оплаты долга:"
+        )
         return ADDING_DEBT_DAYS
     except ValueError:
-        await update.message.reply_text("Пожалуйста, введите корректную сумму:")
+        await update.message.reply_text(
+            "❌ Некорректная сумма. Введите число (например: 1000.50):"
+        )
         return ADDING_RECEIPT_AMOUNT
+    except Exception as e:
+        logger.error(f"Error in add_receipt_amount: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
 
 async def add_receipt_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершение добавления чека"""
-    conn = None
+    """Process debt days and save receipt to database."""
     try:
         days = int(update.message.text)
-        
         if days <= 0:
-            await update.message.reply_text("Количество дней должно быть положительным. Введите корректное число:")
+            await update.message.reply_text(
+                "❌ Количество дней должно быть больше нуля. Попробуйте еще раз:"
+            )
             return ADDING_DEBT_DAYS
+            
+        client_id = context.user_data['selected_client_id']
+        photo_id = context.user_data['receipt_photo_id']
+        amount = context.user_data['receipt_amount']
         
-        # Получаем сохраненные данные
-        client_id = context.user_data.get('selected_client_id')
-        photo_id = context.user_data.get('receipt_photo_id')
-        amount = context.user_data.get('receipt_amount')
-        
-        # Проверяем, что все данные есть
-        if not all([client_id, photo_id, amount]):
-            await update.message.reply_text("Произошла ошибка. Начните процесс добавления чека заново.")
-            return ConversationHandler.END
-        
-        # Сохраняем чек в базу данных
         conn = get_connection()
         cur = conn.cursor()
+        
+        # Add receipt
         cur.execute("""
-            INSERT INTO receipts 
-            (client_id, photo_id, amount, debt_days, date_added)
+            INSERT INTO receipts (client_id, photo_id, amount, debt_days, date_added)
             VALUES (?, ?, ?, ?, ?)
         """, (client_id, photo_id, amount, days, datetime.now()))
+        
+        # Get client name
+        cur.execute("SELECT name FROM clients WHERE id = ?", (client_id,))
+        client_name = cur.fetchone()[0]
+        
         conn.commit()
+        cur.close()
+        conn.close()
         
-        logger.info(f"Добавлен новый чек для клиента {client_id}")
+        # Calculate due date
+        due_date = datetime.now() + timedelta(days=days)
         
-        # Возвращаем главное меню
-        keyboard = [
-            [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-            [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-            [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(
-            "Чек успешно добавлен!",
-            reply_markup=reply_markup
+        success_message = (
+            f"✅ Чек успешно добавлен!\n\n"
+            f"👤 Клиент: {client_name}\n"
+            f"💰 Сумма: {amount:.2f} руб.\n"
+            f"📅 Срок оплаты: {due_date.strftime('%d.%m.%Y')}"
         )
         
+        await update.message.reply_text(
+            success_message,
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    
+        
     except ValueError:
-        await update.message.reply_text("Пожалуйста, введите корректное количество дней:")
+        await update.message.reply_text(
+            "❌ Некорректное количество дней. Введите целое число:"
+        )
         return ADDING_DEBT_DAYS
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при сохранении чека: {e}")
-        await update.message.reply_text("Не удалось сохранить чек. Попробуйте снова.")
+    except Exception as e:
+        logger.error(f"Error in add_receipt_days: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при сохранении чека. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    finally:
-        if conn:
-            conn.close()
-
+        # View receipts
 async def view_receipts_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало просмотра чеков - выбор клиента"""
+    """Start the process of viewing receipts."""
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, name FROM clients")
+        
+        # Get clients with active receipts
+        cur.execute("""
+            SELECT DISTINCT c.id, c.name, c.phone,
+                   COUNT(r.id) as receipt_count,
+                   SUM(r.amount) - COALESCE((
+                       SELECT SUM(amount) 
+                       FROM payments p 
+                       WHERE p.client_id = c.id
+                   ), 0) as total_debt
+            FROM clients c
+            LEFT JOIN receipts r ON c.id = r.client_id
+            GROUP BY c.id, c.name, c.phone
+            HAVING receipt_count > 0
+            ORDER BY c.name
+        """)
         clients = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении списка клиентов: {e}")
-        await update.message.reply_text("Не удалось получить список клиентов. Попробуйте позже.")
+        cur.close()
+        conn.close()
+        
+        if not clients:
+            await update.message.reply_text(
+                "📭 Нет чеков для просмотра.",
+                reply_markup=get_main_keyboard()
+            )
+            return ConversationHandler.END
+        
+        keyboard = []
+        for id, name, phone, receipt_count, total_debt in clients:
+            text = f"{name} ({phone}) - {receipt_count} чеков"
+            if total_debt > 0:
+                text += f", долг: {total_debt:.2f} руб."
+            keyboard.append([InlineKeyboardButton(text, callback_data=f'view_{id}')])
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "👁 Выберите клиента для просмотра чеков:",
+            reply_markup=reply_markup
+        )
+        return SELECTING_CLIENT_FOR_VIEW
+        
+    except Exception as e:
+        logger.error(f"Error in view_receipts_start: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    if not clients:
-        await update.message.reply_text("Нет добавленных клиентов!")
-        return ConversationHandler.END
-    
-    # Создаем клавиатуру с клиентами
-    keyboard = []
-    for client_id, client_name in clients:
-        keyboard.append([InlineKeyboardButton(client_name, callback_data=f'view_{client_id}')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Выберите клиента для просмотра чеков:",
-        reply_markup=reply_markup
-    )
-    return SELECTING_CLIENT_FOR_VIEW
 
 async def show_client_receipts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ чеков для выбранного клиента"""
-    query = update.callback_query
-    await query.answer()
-    
+    """Show all receipts for selected client."""
     try:
+        query = update.callback_query
+        await query.answer()
+        
         client_id = int(query.data.split('_')[1])
         
         conn = get_connection()
         cur = conn.cursor()
+        
+        # Get client info
         cur.execute("""
-            SELECT photo_id, amount, date_added, debt_days 
+            SELECT c.name, c.phone,
+                   SUM(r.amount) as total_amount,
+                   COALESCE((
+                       SELECT SUM(amount)
+                       FROM payments p
+                       WHERE p.client_id = c.id
+                   ), 0) as total_paid
+            FROM clients c
+            LEFT JOIN receipts r ON c.id = r.client_id
+            WHERE c.id = ?
+            GROUP BY c.id, c.name, c.phone
+        """, (client_id,))
+        client_info = cur.fetchone()
+        name, phone, total_amount, total_paid = client_info
+        
+        # Get receipts
+        cur.execute("""
+            SELECT photo_id, amount, date_added, debt_days
             FROM receipts 
-            WHERE client_id = ? 
+            WHERE client_id = ?
             ORDER BY date_added DESC
         """, (client_id,))
         receipts = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении чеков: {e}")
-        await query.edit_message_text("Не удалось получить чеки. Попробуйте позже.")
-        return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    if not receipts:
-        await query.edit_message_text("У этого клиента нет чеков.")
-        return ConversationHandler.END
-    
-    # Отправляем каждый чек отдельным сообщением
-    for photo_id, amount, date_added, debt_days in receipts:
-        # Вычисляем дату погашения долга
-        due_date = datetime.strptime(date_added, '%Y-%m-%d %H:%M:%S.%f') + timedelta(days=debt_days)
         
-        caption = (f"Сумма: {amount} руб.\n"
-                   f"Дата добавления: {date_added}\n"
-                   f"Срок оплаты: {due_date}")
+        cur.close()
+        conn.close()
         
-        try:
+        # Send client summary
+        remaining_debt = total_amount - total_paid
+        summary = (
+            f"👤 Клиент: {name}\n"
+            f"📱 Телефон: {phone}\n"
+            f"💰 Общая сумма долга: {total_amount:.2f} руб.\n"
+            f"💵 Оплачено: {total_paid:.2f} руб.\n"
+            f"📊 Остаток: {remaining_debt:.2f} руб.\n\n"
+            f"📄 Чеки клиента:"
+        )
+        await query.edit_message_text(summary)
+        
+        # Send receipts
+        for photo_id, amount, date_added, debt_days in receipts:
+            due_date = datetime.strptime(date_added, '%Y-%m-%d %H:%M:%S.%f') + timedelta(days=debt_days)
+            is_overdue = datetime.now() > due_date
+            
+            caption = (
+                f"💰 Сумма: {amount:.2f} руб.\n"
+                f"📅 Дата добавления: {date_added.split('.')[0]}\n"
+                f"⏳ Срок оплаты: {due_date.strftime('%d.%m.%Y')}\n"
+                f"❗️ Статус: {'Просрочен' if is_overdue else 'Активен'}"
+            )
+            
             await context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=photo_id,
                 caption=caption
             )
-        except Exception as e:
-            logger.error(f"Ошибка при отправке фото чека: {e}")
-    
-    # Возвращаем главное меню
-    keyboard = [
-        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text="Вернуться в главное меню:",
-        reply_markup=reply_markup
-    )
-    
-    return ConversationHandler.END
-
+        
+        # Send final message with main menu
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Вернуться в главное меню:",
+            reply_markup=get_main_keyboard()
+        )
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Error in show_client_receipts: {e}")
+        await query.edit_message_text(
+            "Произошла ошибка при загрузке чеков. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
+        # Overdue debts
 async def show_overdue_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ просроченных долгов"""
-    logger.info(f"Пользователь {update.effective_user.id} запросил список просроченных долгов")
-    
-    current_time = datetime.now()
-    
+    """Show all overdue debts."""
     try:
+        current_time = datetime.now()
+        
         conn = get_connection()
         cur = conn.cursor()
+        
+        # Get overdue debts with detailed information
         cur.execute("""
             SELECT 
-                c.name, 
-                r.amount, 
-                r.date_added, 
-                r.debt_days,
+                c.name, c.phone,
+                r.amount, r.date_added, r.debt_days,
                 COALESCE((
                     SELECT SUM(amount) 
                     FROM payments p 
-                    WHERE p.client_id = r.client_id
+                    WHERE p.client_id = c.id
                 ), 0) as paid_amount
             FROM receipts r
             JOIN clients c ON r.client_id = c.id
             WHERE datetime(r.date_added, '+' || r.debt_days || ' days') < ?
+            ORDER BY c.name, r.date_added
         """, (current_time,))
+        
         overdue = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении просроченных долгов: {e}")
-        await update.message.reply_text("Произошла ошибка при получении списка долгов.")
-        return
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    keyboard = [
-        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    if not overdue:
-        await update.message.reply_text(
-            "Нет просроченных долгов.",
-            reply_markup=reply_markup
-        )
-        return
-    
-    message = "Просроченные долги:\n\n"
-    for name, amount, date_added, days, paid_amount in overdue:
-        if amount > paid_amount:
-            remaining_debt = amount - paid_amount
-            due_date = datetime.strptime(date_added, '%Y-%m-%d %H:%M:%S.%f') + timedelta(days=days)
+        cur.close()
+        conn.close()
+        
+        if not overdue:
+            await update.message.reply_text(
+                "✅ Нет просроченных долгов.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        
+        # Group by client
+        client_debts = {}
+        for name, phone, amount, date_added, days, paid_amount in overdue:
+            if name not in client_debts:
+                client_debts[name] = {
+                    'phone': phone,
+                    'total_debt': 0,
+                    'paid': paid_amount,
+                    'debts': []
+                }
             
-            message += f"Клиент: {name}\n"
-            message += f"Оставшийся долг: {remaining_debt} руб.\n"
-            message += f"Дата чека: {date_added}\n"
-            message += f"Срок оплаты: {due_date}\n\n"
-    
-    await update.message.reply_text(
-        message,
-        reply_markup=reply_markup
-    )
+            due_date = datetime.strptime(date_added, '%Y-%m-%d %H:%M:%S.%f') + timedelta(days=days)
+            days_overdue = (current_time - due_date).days
+            
+            client_debts[name]['total_debt'] += amount
+            client_debts[name]['debts'].append({
+                'amount': amount,
+                'due_date': due_date,
+                'days_overdue': days_overdue
+            })
+        
+        # Format message
+        message = "⚠️ Просроченные долги:\n\n"
+        for client_name, data in client_debts.items():
+            remaining_debt = data['total_debt'] - data['paid']
+            if remaining_debt <= 0:
+                continue
+                
+            message += f"👤 Клиент: {client_name}\n"
+            message += f"📱 Телефон: {data['phone']}\n"
+            message += f"💰 Общий долг: {data['total_debt']:.2f} руб.\n"
+            message += f"💵 Оплачено: {data['paid']:.2f} руб.\n"
+            message += f"📊 Остаток: {remaining_debt:.2f} руб.\n\n"
+            message += "Просроченные чеки:\n"
+            
+            for debt in data['debts']:
+                message += (
+                    f"- {debt['amount']:.2f} руб. "
+                    f"(просрочка {debt['days_overdue']} дней)\n"
+                )
+            message += "\n"
+        
+        # Split message if it's too long
+        if len(message) > 4096:
+            for x in range(0, len(message), 4096):
+                await update.message.reply_text(message[x:x+4096])
+        else:
+            await update.message.reply_text(message)
+            
+        await update.message.reply_text(
+            "Вернуться в главное меню:",
+            reply_markup=get_main_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in show_overdue_debts: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при получении данных о долгах. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
 
+# Delete receipt
 async def delete_receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало процесса удаления чека - выбор клиента"""
+    """Start the process of deleting a receipt."""
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, name FROM clients")
+        
+        # Get clients with receipts
+        cur.execute("""
+            SELECT DISTINCT c.id, c.name, c.phone,
+                   COUNT(r.id) as receipt_count
+            FROM clients c
+            JOIN receipts r ON c.id = r.client_id
+            GROUP BY c.id, c.name, c.phone
+            HAVING receipt_count > 0
+            ORDER BY c.name
+        """)
         clients = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении списка клиентов: {e}")
-        await update.message.reply_text("Не удалось получить список клиентов. Попробуйте позже.")
+        cur.close()
+        conn.close()
+        
+        if not clients:
+            await update.message.reply_text(
+                "📭 Нет чеков для удаления.",
+                reply_markup=get_main_keyboard()
+            )
+            return ConversationHandler.END
+        
+        keyboard = []
+        for id, name, phone, receipt_count in clients:
+            text = f"{name} ({phone}) - {receipt_count} чеков"
+            keyboard.append([InlineKeyboardButton(text, callback_data=f'del_client_{id}')])
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🗑 Выберите клиента для удаления чека:",
+            reply_markup=reply_markup
+        )
+        return SELECTING_CLIENT_FOR_DELETE
+        
+    except Exception as e:
+        logger.error(f"Error in delete_receipt_start: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    if not clients:
-        await update.message.reply_text("Нет добавленных клиентов!")
-        return ConversationHandler.END
-    
-    # Создаем клавиатуру с клиентами
-    keyboard = []
-    for client_id, client_name in clients:
-        keyboard.append([InlineKeyboardButton(client_name, callback_data=f'del_client_{client_id}')])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Выберите клиента для удаления чека:",
-        reply_markup=reply_markup
-    )
-    return SELECTING_CLIENT_FOR_DELETE
-
-async def show_receipts_for_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ чеков для удаления"""
-    query = update.callback_query
-    await query.answer()
-    
+        async def show_receipts_for_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show receipts available for deletion."""
     try:
+        query = update.callback_query
+        await query.answer()
+        
         client_id = int(query.data.split('_')[2])
         context.user_data['selected_client_id'] = client_id
         
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, photo_id, amount, date_added 
-            FROM receipts 
-            WHERE client_id = ?
+            SELECT r.id, r.photo_id, r.amount, r.date_added, c.name
+            FROM receipts r
+            JOIN clients c ON r.client_id = c.id
+            WHERE r.client_id = ?
+            ORDER BY r.date_added DESC
         """, (client_id,))
         receipts = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении чеков для удаления: {e}")
-        await query.edit_message_text("Не удалось получить чеки. Попробуйте позже.")
-        return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    if not receipts:
-        await query.edit_message_text("У этого клиента нет чеков.")
-        return ConversationHandler.END
-    
-    # Отправляем каждый чек с кнопкой удаления
-    for receipt_id, photo_id, amount, date_added in receipts:
-        keyboard = [[InlineKeyboardButton(
-            "Удалить этот чек", 
-            callback_data=f'delete_receipt_{receipt_id}'
-        )]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        cur.close()
+        conn.close()
         
-        caption = f"Сумма: {amount} руб.\nДата: {date_added}"
+        await query.edit_message_text(f"Чеки клиента:")
         
-        try:
+        for receipt_id, photo_id, amount, date_added, client_name in receipts:
+            keyboard = [[InlineKeyboardButton("❌ Удалить чек", 
+                                          callback_data=f'delete_receipt_{receipt_id}')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            caption = (
+                f"👤 Клиент: {client_name}\n"
+                f"💰 Сумма: {amount:.2f} руб.\n"
+                f"📅 Дата: {date_added}"
+            )
+            
             await context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=photo_id,
                 caption=caption,
                 reply_markup=reply_markup
             )
-        except Exception as e:
-            logger.error(f"Ошибка при отправке фото чека: {e}")
-    
-    return SELECTING_RECEIPT_FOR_DELETE
+        
+        return SELECTING_RECEIPT_FOR_DELETE
+        
+    except Exception as e:
+        logger.error(f"Error in show_receipts_for_delete: {e}")
+        await query.edit_message_text(
+            "Произошла ошибка. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
 
 async def delete_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаление выбранного чека"""
-    query = update.callback_query
-    await query.answer()
-    
+    """Delete selected receipt."""
     try:
+        query = update.callback_query
+        await query.answer()
+        
         receipt_id = int(query.data.split('_')[2])
         
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM receipts WHERE id = ?", (receipt_id,))
         conn.commit()
+        cur.close()
+        conn.close()
         
-        logger.info(f"Удален чек с ID: {receipt_id}")
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при удалении чека: {e}")
-        await query.edit_message_text("Не удалось удалить чек. Попробуйте позже.")
+        await query.edit_message_text(
+            "✅ Чек успешно удален!",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    keyboard = [
-        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await query.edit_message_text(
-        "Чек успешно удален!",
-        reply_markup=reply_markup
-    )
-    return ConversationHandler.END
-
-async def pay_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало процесса оплаты долга"""
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT 
-                c.id, 
-                c.name, 
-                TOTAL(r.amount) - COALESCE((
-                    SELECT TOTAL(amount) 
-                    FROM payments p 
-                    WHERE p.client_id = c.id
-                ), 0) as debt
-            FROM clients c
-            LEFT JOIN receipts r ON c.id = r.client_id
-            GROUP BY c.id, c.name
-            HAVING debt > 0
-        """)
-        clients = cur.fetchall()
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при получении списка должников: {e}")
-        await update.message.reply_text("Не удалось получить список должников. Попробуйте позже.")
-        return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    if not clients:
-        await update.message.reply_text("Нет клиентов с долгами.")
-        return ConversationHandler.END
-    
-    keyboard = []
-    for client_id, name, debt in clients:
-        keyboard.append([InlineKeyboardButton(
-            f"{name} (Долг: {debt} руб.)", 
-            callback_data=f'pay_{client_id}'
-        )])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Выберите клиента для оплаты долга:",
-        reply_markup=reply_markup
-    )
-    return SELECTING_CLIENT_FOR_PAYMENT
-
-async def add_payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор суммы платежа"""
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        client_id = int(query.data.split('_')[1])
-        context.user_data['selected_client_id'] = client_id
         
-        await query.edit_message_text("Введите сумму оплаты:")
-        return ADDING_PAYMENT_AMOUNT
     except Exception as e:
-        logger.error(f"Ошибка при выборе клиента для оплаты: {e}")
-        await query.edit_message_text("Произошла ошибка. Попробуйте снова.")
+        logger.error(f"Error in delete_receipt: {e}")
+        await query.edit_message_text(
+            "Произошла ошибка при удалении чека. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return ConversationHandler.END
-
-async def process_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка платежа"""
-    try:
-        amount = float(update.message.text.replace(',', '.'))
-        client_id = context.user_data['selected_client_id']
-        
-        conn = get_connection()
-        cur = conn.cursor()
-        
-        # Добавление платежа
-        cur.execute("""
-            INSERT INTO payments (client_id, amount, date)
-            VALUES (?, ?, ?)
-        """, (client_id, amount, datetime.now()))
-        
-        # Получение информации о клиенте и остатке долга
-        cur.execute("""
-            SELECT 
-                c.name, 
-                TOTAL(r.amount) - (COALESCE((
-                    SELECT TOTAL(amount) 
-                    FROM payments p 
-                    WHERE p.client_id = c.id
-                ), 0) + ?) as remaining_debt
-            FROM clients c
-            JOIN receipts r ON c.id = r.client_id
-            WHERE c.id = ?
-            GROUP BY c.name
-        """, (amount, client_id))
-        
-        result = cur.fetchone()
-        client_name, remaining_debt = result if result else (None, 0)
-        
-        conn.commit()
-        
-        logger.info(f"Добавлен платеж для клиента {client_id}: {amount} руб.")
-        
-        # Возвращаем главное меню
-        keyboard = [
-            [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-            [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-            [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        message = f"Оплата в размере {amount} руб. добавлена для клиента {client_name}\n"
-        if remaining_debt and remaining_debt > 0:
-            message += f"Оставшийся долг: {remaining_debt} руб."
-        else:
-            message += "Долг полностью погашен!"
-        
-        await update.message.reply_text(
-            message,
-            reply_markup=reply_markup)
-    except ValueError:
-        await update.message.reply_text("Пожалуйста, введите корректную сумму.")
-        return ADDING_PAYMENT_AMOUNT
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка при обработке платежа: {e}")
-        await update.message.reply_text("Произошла ошибка при обработке платежа.")
-        return ConversationHandler.END
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-    
-    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена текущей операции"""
-    logger.info(f"Пользователь {update.effective_user.id} отменил операцию")
-    
-    keyboard = [
-        [KeyboardButton("👤 Добавить клиента"), KeyboardButton("📄 Добавить чек")],
-        [KeyboardButton("👁 Просмотр чеков"), KeyboardButton("⏰ Просроченные долги")],
-        [KeyboardButton("🗑 Удаление чеков"), KeyboardButton("💰 Оплата долгов")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
+    """Cancel current operation."""
     await update.message.reply_text(
         'Операция отменена.',
-        reply_markup=reply_markup
+        reply_markup=get_main_keyboard()
     )
     return ConversationHandler.END
 
 def main():
-    """Основная функция запуска бота"""
-    # Проверка токена бота
-    token = os.environ.get('BOT_TOKEN')
-    if not token:
-        logger.error("Не указан токен Telegram Bot. Установите переменную окружения BOT_TOKEN.")
-        return
-    
-    # Инициализация базы данных
+    """Start the bot."""
     try:
+        # Initialize database
         init_db()
-    except Exception as db_error:
-        logger.error(f"Ошибка инициализации базы данных: {db_error}")
-        return
-    
-    # Создание приложения бота
-    try:
+        
+        # Get token
+        token = os.getenv('BOT_TOKEN')
+        if not token:
+            raise ValueError("No token provided")
+        
+        # Initialize bot
         application = Application.builder().token(token).build()
         
-        # Добавление обработчиков команд
-        application.add_handler(CommandHandler('start', start))
-        
-        # Добавление клиента
+        # Add conversation handlers
         add_client_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^👤 Добавить клиента$'), add_client_start)],
             states={
@@ -745,9 +737,7 @@ def main():
             },
             fallbacks=[CommandHandler('cancel', cancel)]
         )
-        application.add_handler(add_client_conv)
         
-        # Добавление чека
         add_receipt_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^📄 Добавить чек$'), add_receipt_start)],
             states={
@@ -760,9 +750,7 @@ def main():
             },
             fallbacks=[CommandHandler('cancel', cancel)]
         )
-        application.add_handler(add_receipt_conv)
         
-        # Просмотр чеков
         view_receipts_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^👁 Просмотр чеков$'), view_receipts_start)],
             states={
@@ -770,12 +758,7 @@ def main():
             },
             fallbacks=[CommandHandler('cancel', cancel)]
         )
-        application.add_handler(view_receipts_conv)
         
-        # Просроченные долги
-        application.add_handler(MessageHandler(filters.Regex('^⏰ Просроченные долги$'), show_overdue_debts))
-        
-        # Удаление чека
         delete_receipt_conv = ConversationHandler(
             entry_points=[MessageHandler(filters.Regex('^🗑 Удаление чеков$'), delete_receipt_start)],
             states={
@@ -788,29 +771,24 @@ def main():
             },
             fallbacks=[CommandHandler('cancel', cancel)]
         )
+        
+        # Add handlers
+        application.add_handler(CommandHandler('start', start))
+        application.add_handler(add_client_conv)
+        application.add_handler(add_receipt_conv)
+        application.add_handler(view_receipts_conv)
+        application.add_handler(MessageHandler(
+            filters.Regex('^⏰ Просроченные долги$'), 
+            show_overdue_debts
+        ))
         application.add_handler(delete_receipt_conv)
         
-        # Оплата долга
-        pay_debt_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^💰 Оплата долгов$'), pay_debt_start)],
-            states={
-                SELECTING_CLIENT_FOR_PAYMENT: [
-                    CallbackQueryHandler(add_payment_amount, pattern='^pay_')
-                ],
-                ADDING_PAYMENT_AMOUNT: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, process_payment)
-                ]
-            },
-            fallbacks=[CommandHandler('cancel', cancel)]
-        )
-        application.add_handler(pay_debt_conv)
+        # Start polling
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
         
-        # Запуск бота
-        logger.info("Бот запускается...")
-        application.run_polling(drop_pending_updates=True)
-    
     except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
+        logger.error(f"Error in main: {e}")
+        raise
 
 if __name__ == '__main__':
     main()
